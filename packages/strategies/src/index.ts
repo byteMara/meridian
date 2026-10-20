@@ -22,6 +22,7 @@ export * from "./sizing";
 export * from "./backtest";
 export * from "./portfolio";
 export * from "./strategy";
+export * from "./composition";
 export * from "./clock";
 export * from "./funding";
 export * from "./scenario";

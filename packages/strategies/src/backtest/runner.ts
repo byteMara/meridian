@@ -249,7 +249,10 @@ function fundingPositions(
     const stroops = position.size.toStroops();
     const size = FixedPointDecimal.fromStroops(abs(stroops)).mul(price);
     positions.push({
-      id: position.asset,
+      id:
+        position.memberId === undefined
+          ? position.asset
+          : `${position.memberId}:${position.asset}`,
       notional: size,
       rate: stroops > 0n ? longRate : rate,
     });
@@ -297,6 +300,7 @@ function fill(
 
   portfolio.applyFill({
     asset: order.asset,
+    memberId: order.memberId,
     size: order.size,
     price: adjusted.effectivePrice,
     fee: adjusted.totalCost,

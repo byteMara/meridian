@@ -4,6 +4,8 @@ import type { AssetSymbol, SimulationTimestamp } from "./types";
 /** Read-only view of one open position. */
 export interface PositionView {
   readonly asset: AssetSymbol;
+  /** Present when the position belongs to a composed strategy member. */
+  readonly memberId?: string;
   /** Signed size: positive long, negative short. */
   readonly size: FixedPointDecimal;
   readonly basis: FixedPointDecimal;
@@ -35,6 +37,8 @@ export interface Order {
   readonly asset: AssetSymbol;
   readonly size: FixedPointDecimal;
   readonly reason?: string;
+  /** Internal portfolio namespace assigned by ComposedStrategy. */
+  readonly memberId?: string;
 }
 
 export interface StrategyInitParams<TConfig> {
