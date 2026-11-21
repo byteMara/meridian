@@ -48,16 +48,8 @@ export default defineConfig({
         text: "Strategies",
         items: [
           {
-            text: "Strategies App Guide",
-            link: "/strategies/app",
-          },
-          {
             text: "Architecture Overview",
             link: "/strategies/architecture",
-          },
-          {
-            text: "Custom Strategy Tutorial",
-            link: "/strategies/custom-strategy",
           },
           {
             text: "Delta-Neutral Strategy",
@@ -71,7 +63,6 @@ export default defineConfig({
             text: "Strategy Composition Guide",
             link: "/strategies/composition",
           },
-          { text: "Risk Metrics", link: "/strategies/risk-metrics" },
         ],
       },
       {
@@ -105,10 +96,6 @@ export default defineConfig({
           {
             text: "Incident Response",
             link: "/operations/incident-response",
-          },
-          {
-            text: "Wallet Signing Troubleshooting",
-            link: "/operations/wallet-signing-troubleshooting",
           },
         ],
       },

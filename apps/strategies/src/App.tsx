@@ -4,15 +4,6 @@ import { SingleRunView } from "./views/SingleRunView";
 import type { ScenarioRun } from "./lib/scenario-run";
 import { HistoryView } from "./views/HistoryView";
 import { ComparisonView } from "./views/ComparisonView";
-import {
-  clearRunHistory,
-  createRunRecord,
-  deleteRunHistoryRecord,
-  loadRunHistory,
-  saveRunHistory,
-  toScenarioRun,
-} from "./lib/run-history";
-import type { RunRecord } from "./lib/run-history";
 
 export type StrategyView = "single-run" | "history" | "comparison";
 
@@ -32,42 +23,6 @@ export default function App() {
   // Held here rather than in the view so the result and risk views can read
   // the latest run without a reload, and it survives switching tabs.
   const [latestRun, setLatestRun] = useState<ScenarioRun | null>(null);
-  const [history, setHistory] = useState(loadRunHistory);
-  const [selectedRunIds, setSelectedRunIds] = useState<ReadonlySet<string>>(
-    () => new Set()
-  );
-
-  const handleRunComplete = (run: ScenarioRun) => {
-    setLatestRun(run);
-    const record = createRunRecord(run);
-    setHistory({
-      records: saveRunHistory([record, ...history.records]),
-      dropped: history.dropped,
-    });
-  };
-
-  const handleDeleteRun = (id: string) => {
-    setHistory({
-      records: deleteRunHistoryRecord(history.records, id),
-      dropped: history.dropped,
-    });
-    setSelectedRunIds((current) => {
-      const next = new Set(current);
-      next.delete(id);
-      return next;
-    });
-  };
-
-  const handleClearHistory = () => {
-    clearRunHistory();
-    setHistory({ ...history, records: [] });
-    setSelectedRunIds(new Set());
-  };
-
-  const handleOpenRun = (record: RunRecord) => {
-    setLatestRun(toScenarioRun(record));
-    setActiveView("single-run");
-  };
 
   return (
     <div className="shell">
@@ -151,35 +106,12 @@ export default function App() {
         {activeView === "single-run" && (
           <SingleRunView
             latestRun={latestRun}
-            onRunComplete={handleRunComplete}
+            onRunComplete={setLatestRun}
             onRunCleared={() => setLatestRun(null)}
           />
         )}
-        {activeView === "history" && (
-          <HistoryView
-            records={history.records}
-            droppedRecords={history.dropped}
-            selectedRunIds={selectedRunIds}
-            onOpenRun={handleOpenRun}
-            onDeleteRun={handleDeleteRun}
-            onClearHistory={handleClearHistory}
-            onToggleComparison={(id) =>
-              setSelectedRunIds((current) => {
-                const next = new Set(current);
-                if (next.has(id)) next.delete(id);
-                else next.add(id);
-                return next;
-              })
-            }
-          />
-        )}
-        {activeView === "comparison" && (
-          <ComparisonView
-            records={history.records.filter((record) =>
-              selectedRunIds.has(record.id)
-            )}
-          />
-        )}
+        {activeView === "history" && <HistoryView />}
+        {activeView === "comparison" && <ComparisonView />}
       </main>
     </div>
   );

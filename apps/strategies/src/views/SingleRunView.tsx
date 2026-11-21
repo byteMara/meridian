@@ -21,7 +21,6 @@ import {
 import type { ScenarioFormValues } from "../lib/scenario-form";
 import { formatDecimal } from "../lib/format";
 import { runScenario } from "../lib/scenario-run";
-import { RiskMetricsPanel } from "../components/RiskMetricsPanel";
 import type { ScenarioRun, ScenarioRunError } from "../lib/scenario-run";
 
 export interface SingleRunViewProps {
@@ -515,13 +514,6 @@ export function SingleRunView({
             {formatDecimal(run.result.strategyEquity.toString())}.
           </p>
         </section>
-      )}
-
-      {run && error === null && (
-        <RiskMetricsPanel
-          snapshots={run.result.snapshots}
-          step={run.scenario.window.step}
-        />
       )}
     </div>
   );

@@ -50,7 +50,7 @@ const DEFAULT_RPC_TIMEOUT_MS = 10_000;
 
 /** Admin actions worth an immediate alert. See the file header for why
  *  `accept` is deliberately left out. */
-export const ALERTABLE_ACTIONS: ReadonlySet<RpcAdminActionType> = new Set([
+const ALERTABLE_ACTIONS: ReadonlySet<RpcAdminActionType> = new Set([
   "paused",
   "transfer",
   "adapter",
