@@ -7,20 +7,6 @@ import {
 } from "@stellar/stellar-sdk";
 import { MAX_ADMIN_SLIPPAGE_BPS } from "@meridian/shared";
 import { prepareSorobanTx, simulateView } from "@meridian/stellar-sdk-helpers";
-import {
-  TimeoutError,
-  UnsupportedError,
-  ValidationError,
-  SimulationError,
-  classifyError,
-} from "./errors.js";
-import {
-  redact,
-  safeCall,
-  sanitizeError,
-  type RequestEvent,
-} from "./instrumentation.js";
-import { withRetry } from "./retry.js";
 import type {
   VaultConfig,
   Position,
@@ -28,9 +14,6 @@ import type {
   AdapterInfo,
   WithdrawPreview,
 } from "./types.js";
-
-/** Default RPC timeout, unchanged from before timeouts were configurable. */
-export const DEFAULT_RPC_TIMEOUT_MS = 12_000;
 
 /** Scale of `get_share_price`: this value means one asset stroop per share. */
 export const SHARE_PRICE_SCALE = 10_000_000n;
@@ -176,14 +159,6 @@ export abstract class VaultBase {
   protected readonly config: VaultConfig;
 
   constructor(config: VaultConfig) {
-    for (const [name, value] of [
-      ["timeouts.rpcMs", config.timeouts?.rpcMs],
-      ["timeouts.operationMs", config.timeouts?.operationMs],
-    ] as const) {
-      if (value !== undefined && !(Number.isFinite(value) && value > 0)) {
-        throw new ValidationError(`${name} must be a positive number`);
-      }
-    }
     this.config = config;
   }
 
@@ -199,81 +174,7 @@ export abstract class VaultBase {
    */
   protected makeRpcServer(): SorobanRpc.Server {
     return new SorobanRpc.Server(this.config.network.rpcUrl, {
-      timeout: this.config.timeouts?.rpcMs ?? DEFAULT_RPC_TIMEOUT_MS,
-    });
-  }
-
-  /**
-   * Run one public SDK operation with typed errors, the optional per-call
-   * time budget, the configured retry policy and instrumentation hooks.
-   * `kind: "build"` marks methods that assemble a transaction: they only
-   * retry when the policy sets `retryTxBuilders`.
-   */
-  private async run<T>(
-    operation: string,
-    params: Record<string, unknown>,
-    kind: "read" | "build",
-    fn: () => Promise<T>
-  ): Promise<T> {
-    const { hooks, retry, timeouts } = this.config;
-    const safeParams = redact(params) as Record<string, unknown>;
-    const base = (attempt: number): RequestEvent => ({
-      operation,
-      params: safeParams,
-      attempt,
-    });
-    const policy =
-      retry && (kind === "read" || retry.retryTxBuilders) ? retry : undefined;
-    const operationMs = timeouts?.operationMs;
-
-    const attemptFn = async (attempt: number): Promise<T> => {
-      const started = Date.now();
-      safeCall(hooks?.onRequestStart, base(attempt));
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      try {
-        const work = fn();
-        const result =
-          operationMs === undefined
-            ? await work
-            : await Promise.race([
-                work,
-                new Promise<never>((_, reject) => {
-                  timer = setTimeout(
-                    () =>
-                      reject(
-                        new TimeoutError(
-                          `${operation} timed out after ${operationMs}ms`
-                        )
-                      ),
-                    operationMs
-                  );
-                }),
-              ]);
-        safeCall(hooks?.onRequestSuccess, {
-          ...base(attempt),
-          durationMs: Date.now() - started,
-        });
-        return result;
-      } catch (raw) {
-        const error = classifyError(raw);
-        safeCall(hooks?.onRequestError, {
-          ...base(attempt),
-          durationMs: Date.now() - started,
-          error: sanitizeError(error),
-        });
-        throw error;
-      } finally {
-        if (timer !== undefined) clearTimeout(timer);
-      }
-    };
-
-    return withRetry(attemptFn, policy, {
-      onRetry: ({ attempt, delayMs, error }) =>
-        safeCall(hooks?.onRetry, {
-          ...base(attempt),
-          delayMs,
-          error: sanitizeError(error),
-        }),
+      timeout: 12_000,
     });
   }
 
@@ -353,23 +254,15 @@ export abstract class VaultBase {
     receiver: string,
     minSharesOut: bigint = 0n
   ): Promise<Transaction> {
-    if (assets <= 0n) throw new ValidationError("assets must be positive");
-    if (minSharesOut < 0n) {
-      throw new ValidationError("minSharesOut must be non-negative");
-    }
-    return this.run(
-      "deposit",
-      { assets, receiver, minSharesOut },
-      "build",
-      () =>
-        this.prepare(
-          this.contract().call(
-            "deposit",
-            addrScVal(receiver),
-            i128(assets),
-            i128(minSharesOut)
-          )
-        )
+    if (assets <= 0n) throw new Error("assets must be positive");
+    if (minSharesOut < 0n) throw new Error("minSharesOut must be non-negative");
+    return this.prepare(
+      this.contract().call(
+        "deposit",
+        addrScVal(receiver),
+        i128(assets),
+        i128(minSharesOut)
+      )
     );
   }
 
@@ -403,75 +296,27 @@ export abstract class VaultBase {
     owner: string,
     minUsdcOut: bigint = 0n
   ): Promise<Transaction> {
-    if (assets <= 0n) throw new ValidationError("assets must be positive");
-    if (minUsdcOut < 0n) {
-      throw new ValidationError("minUsdcOut must be non-negative");
-    }
-    if (receiver !== owner) {
-      throw new ValidationError(
-        "receiver must equal owner: MeridianVault pays USDC to the account that authorises the withdrawal"
-      );
-    }
-    return this.run(
-      "withdraw",
-      { assets, receiver, owner, minUsdcOut },
-      "build",
-      async () => {
-        const [totalAssets, totalSupply] = await Promise.all([
-          this.readTotalAssets(),
-          this.readTotalSupply(),
-        ]);
-        if (totalAssets <= 0n || totalSupply <= 0n) {
-          throw new UnsupportedError(
-            "vault has no redeemable assets or shares"
-          );
-        }
-        const shares = (assets * totalSupply + totalAssets - 1n) / totalAssets;
-        return this.prepare(
-          this.contract().call(
-            "withdraw",
-            addrScVal(owner),
-            i128(shares),
-            i128(minUsdcOut)
-          )
-        );
-      }
-    );
-  }
-
-  /**
-   * Withdraw exact net USDC `assets` amount from the vault, burning at most
-   * `maxSharesIn` mUSDC shares from `owner`.
-   *
-   * Calls the contract's `withdraw_assets(owner, assets, max_shares_in)` entry
-   * point, where the contract computes the authoritative required shares
-   * accounting for performance fees, adapter losses, and rounding.
-   *
-   * @param assets      USDC amount in stroops to receive
-   * @param receiver    Stellar G-address to receive USDC (must equal owner)
-   * @param owner       Stellar G-address whose mUSDC shares are burned
-   * @param maxSharesIn Maximum acceptable mUSDC shares to burn in stroops
-   *                    (defaults to 2^127 - 1, which disables share cap enforcement)
-   */
-  async withdrawAssets(
-    assets: bigint,
-    receiver: string,
-    owner: string,
-    maxSharesIn: bigint = (1n << 127n) - 1n
-  ): Promise<Transaction> {
     if (assets <= 0n) throw new Error("assets must be positive");
-    if (maxSharesIn < 0n) throw new Error("maxSharesIn must be non-negative");
+    if (minUsdcOut < 0n) throw new Error("minUsdcOut must be non-negative");
     if (receiver !== owner) {
       throw new Error(
         "receiver must equal owner: MeridianVault pays USDC to the account that authorises the withdrawal"
       );
     }
+    const [totalAssets, totalSupply] = await Promise.all([
+      this.totalAssets(),
+      this.totalSupply(),
+    ]);
+    if (totalAssets <= 0n || totalSupply <= 0n) {
+      throw new Error("vault has no redeemable assets or shares");
+    }
+    const shares = (assets * totalSupply + totalAssets - 1n) / totalAssets;
     return this.prepare(
       this.contract().call(
-        "withdraw_assets",
+        "withdraw",
         addrScVal(owner),
-        i128(assets),
-        i128(maxSharesIn)
+        i128(shares),
+        i128(minUsdcOut)
       )
     );
   }
@@ -485,12 +330,10 @@ export abstract class VaultBase {
    * @param paused `true` to pause deposits, `false` to resume them
    */
   async setPaused(paused: boolean): Promise<Transaction> {
-    return this.run("setPaused", { paused }, "build", () =>
-      this.prepare(
-        this.contract().call(
-          "set_paused",
-          nativeToScVal(paused, { type: "bool" })
-        )
+    return this.prepare(
+      this.contract().call(
+        "set_paused",
+        nativeToScVal(paused, { type: "bool" })
       )
     );
   }
@@ -504,8 +347,8 @@ export abstract class VaultBase {
    * @param newAdapter Bech32 C-address of the replacement adapter contract
    */
   async setAdapter(newAdapter: string): Promise<Transaction> {
-    return this.run("setAdapter", { newAdapter }, "build", () =>
-      this.prepare(this.contract().call("set_adapter", addrScVal(newAdapter)))
+    return this.prepare(
+      this.contract().call("set_adapter", addrScVal(newAdapter))
     );
   }
 
@@ -520,10 +363,8 @@ export abstract class VaultBase {
    * @param newAdapter Bech32 C-address of the adapter being migrated to
    */
   async beginMigration(newAdapter: string): Promise<Transaction> {
-    return this.run("beginMigration", { newAdapter }, "build", () =>
-      this.prepare(
-        this.contract().call("begin_migration", addrScVal(newAdapter))
-      )
+    return this.prepare(
+      this.contract().call("begin_migration", addrScVal(newAdapter))
     );
   }
 
@@ -543,22 +384,16 @@ export abstract class VaultBase {
     maxSlippageBps: number
   ): Promise<Transaction> {
     if (maxSlippageBps < 0 || maxSlippageBps > MAX_ADMIN_SLIPPAGE_BPS) {
-      throw new ValidationError(
+      throw new Error(
         `maxSlippageBps must be between 0 and ${MAX_ADMIN_SLIPPAGE_BPS}`
       );
     }
-    return this.run(
-      "migrateAdapter",
-      { newAdapter, maxSlippageBps },
-      "build",
-      () =>
-        this.prepare(
-          this.contract().call(
-            "migrate_adapter",
-            addrScVal(newAdapter),
-            u32(maxSlippageBps)
-          )
-        )
+    return this.prepare(
+      this.contract().call(
+        "migrate_adapter",
+        addrScVal(newAdapter),
+        u32(maxSlippageBps)
+      )
     );
   }
 
@@ -577,12 +412,6 @@ export abstract class VaultBase {
    * @param account Stellar G-address to look up
    */
   async getPosition(account: string): Promise<Position | null> {
-    return this.run("getPosition", { account }, "read", () =>
-      this.readPosition(account)
-    );
-  }
-
-  private async readPosition(account: string): Promise<Position | null> {
     const callerScVal = addrScVal(account);
     const server = this.makeRpcServer();
     const { passphrase } = this.config.network;
@@ -652,9 +481,7 @@ export abstract class VaultBase {
    * @param account Stellar G-address to look up
    */
   async getPrincipal(account: string): Promise<bigint> {
-    return this.run("getPrincipal", { account }, "read", async () =>
-      bigIntFrom(await this.view("get_principal", addrScVal(account)))
-    );
+    return bigIntFrom(await this.view("get_principal", addrScVal(account)));
   }
 
   // -------------------------------------------------------------------------
@@ -666,10 +493,6 @@ export abstract class VaultBase {
    * ERC-4626 `totalAssets()`.
    */
   async totalAssets(): Promise<bigint> {
-    return this.run("totalAssets", {}, "read", () => this.readTotalAssets());
-  }
-
-  private async readTotalAssets(): Promise<bigint> {
     return bigIntFrom(await this.view("get_total_assets"));
   }
 
@@ -678,10 +501,6 @@ export abstract class VaultBase {
    * ERC-4626 `totalSupply()`.
    */
   async totalSupply(): Promise<bigint> {
-    return this.run("totalSupply", {}, "read", () => this.readTotalSupply());
-  }
-
-  private async readTotalSupply(): Promise<bigint> {
     return bigIntFrom(await this.view("get_total_shares"));
   }
 
@@ -693,17 +512,11 @@ export abstract class VaultBase {
    * @param assets Amount in stroops to convert
    */
   async convertToShares(assets: bigint): Promise<bigint> {
-    return this.run("convertToShares", { assets }, "read", () =>
-      this.readConvertToShares(assets)
-    );
-  }
-
-  private async readConvertToShares(assets: bigint): Promise<bigint> {
     const live = await this.optionalView("convert_to_shares", i128(assets));
     if (live !== undefined) return bigIntFrom(live);
     const [ta, ts] = await Promise.all([
-      this.readTotalAssets(),
-      this.readTotalSupply(),
+      this.totalAssets(),
+      this.totalSupply(),
     ]);
     return convertAssetsToShares(assets, ta, ts);
   }
@@ -720,15 +533,13 @@ export abstract class VaultBase {
    * @param shares Share amount in stroops to convert
    */
   async convertToAssets(shares: bigint): Promise<bigint> {
-    return this.run("convertToAssets", { shares }, "read", async () => {
-      const live = await this.optionalView("convert_to_assets", i128(shares));
-      if (live !== undefined) return bigIntFrom(live);
-      const [ta, ts] = await Promise.all([
-        this.readTotalAssets(),
-        this.readTotalSupply(),
-      ]);
-      return convertSharesToAssets(shares, ta, ts);
-    });
+    const live = await this.optionalView("convert_to_assets", i128(shares));
+    if (live !== undefined) return bigIntFrom(live);
+    const [ta, ts] = await Promise.all([
+      this.totalAssets(),
+      this.totalSupply(),
+    ]);
+    return convertSharesToAssets(shares, ta, ts);
   }
 
   /**
@@ -737,9 +548,7 @@ export abstract class VaultBase {
    * Requires a vault deployment that exposes the view.
    */
   async getSharePrice(): Promise<bigint> {
-    return this.run("getSharePrice", {}, "read", async () =>
-      bigIntFrom(await this.view("get_share_price"))
-    );
+    return bigIntFrom(await this.view("get_share_price"));
   }
 
   /**
@@ -751,11 +560,9 @@ export abstract class VaultBase {
    * @param assets Amount in stroops (1 USDC = 10 000 000)
    */
   async previewDeposit(assets: bigint): Promise<bigint> {
-    return this.run("previewDeposit", { assets }, "read", async () => {
-      const live = await this.optionalView("preview_deposit", i128(assets));
-      if (live !== undefined) return bigIntFrom(live);
-      return this.readConvertToShares(assets);
-    });
+    const live = await this.optionalView("preview_deposit", i128(assets));
+    if (live !== undefined) return bigIntFrom(live);
+    return this.convertToShares(assets);
   }
 
   /**
@@ -771,27 +578,25 @@ export abstract class VaultBase {
     owner: string,
     shares: bigint
   ): Promise<WithdrawPreview> {
-    return this.run("previewWithdraw", { owner, shares }, "read", async () => {
-      const raw = (await this.optionalView(
-        "preview_withdraw",
-        addrScVal(owner),
-        i128(shares)
-      )) as Record<string, unknown> | null | undefined;
-      if (raw === undefined) {
-        throw new UnsupportedError(
-          "preview_withdraw is not available on this vault deployment"
-        );
-      }
-      if (raw === null) {
-        throw new SimulationError("preview_withdraw returned no result");
-      }
-      return {
-        grossAssets: bigIntFrom(raw.gross_assets),
-        fee: bigIntFrom(raw.fee),
-        treasuryShares: bigIntFrom(raw.treasury_shares),
-        assetsOut: bigIntFrom(raw.assets_out),
-      };
-    });
+    const raw = (await this.optionalView(
+      "preview_withdraw",
+      addrScVal(owner),
+      i128(shares)
+    )) as Record<string, unknown> | null | undefined;
+    if (raw === undefined) {
+      throw new Error(
+        "preview_withdraw is not available on this vault deployment"
+      );
+    }
+    if (raw === null) {
+      throw new Error("preview_withdraw returned no result");
+    }
+    return {
+      grossAssets: bigIntFrom(raw.gross_assets),
+      fee: bigIntFrom(raw.fee),
+      treasuryShares: bigIntFrom(raw.treasury_shares),
+      assetsOut: bigIntFrom(raw.assets_out),
+    };
   }
 
   /**
@@ -800,15 +605,7 @@ export abstract class VaultBase {
    * paused. ERC-4626 `maxDeposit(address)`.
    */
   async maxDeposit(_receiver: string): Promise<bigint> {
-    return this.run("maxDeposit", { receiver: _receiver }, "read", () =>
-      this.readMaxDeposit()
-    );
-  }
-
-  private async readMaxDeposit(): Promise<bigint> {
-    return (await this.readIsPaused())
-      ? 0n
-      : BigInt("999999999999999999999999999");
+    return (await this.isPaused()) ? 0n : BigInt("999999999999999999999999999");
   }
 
   /**
@@ -817,17 +614,15 @@ export abstract class VaultBase {
    * ERC-4626 `maxMint(address)`.
    */
   async maxMint(_receiver: string): Promise<bigint> {
-    return this.run("maxMint", { receiver: _receiver }, "read", async () => {
-      const maxDep = await this.readMaxDeposit();
-      if (maxDep === 0n) return 0n;
-      // Local math on purpose: `maxDep` is a sentinel far above any real
-      // deposit, and the on-chain view would reject it with an i128 overflow.
-      const [ta, ts] = await Promise.all([
-        this.readTotalAssets(),
-        this.readTotalSupply(),
-      ]);
-      return convertAssetsToShares(maxDep, ta, ts);
-    });
+    const maxDep = await this.maxDeposit(_receiver);
+    if (maxDep === 0n) return 0n;
+    // Local math on purpose: `maxDep` is a sentinel far above any real
+    // deposit, and the on-chain view would reject it with an i128 overflow.
+    const [ta, ts] = await Promise.all([
+      this.totalAssets(),
+      this.totalSupply(),
+    ]);
+    return convertAssetsToShares(maxDep, ta, ts);
   }
 
   /**
@@ -839,10 +634,8 @@ export abstract class VaultBase {
    * @param owner Stellar G-address to check
    */
   async maxWithdraw(owner: string): Promise<bigint> {
-    return this.run("maxWithdraw", { owner }, "read", async () => {
-      const pos = await this.readPosition(owner);
-      return pos?.deposited ?? 0n;
-    });
+    const pos = await this.getPosition(owner);
+    return pos?.deposited ?? 0n;
   }
 
   /**
@@ -854,10 +647,8 @@ export abstract class VaultBase {
    * @param owner Stellar G-address to check
    */
   async maxRedeem(owner: string): Promise<bigint> {
-    return this.run("maxRedeem", { owner }, "read", async () => {
-      const pos = await this.readPosition(owner);
-      return pos?.shares ?? 0n;
-    });
+    const pos = await this.getPosition(owner);
+    return pos?.shares ?? 0n;
   }
 
   // -------------------------------------------------------------------------
@@ -869,10 +660,6 @@ export abstract class VaultBase {
    * and leaves withdrawals open.
    */
   async isPaused(): Promise<boolean> {
-    return this.run("isPaused", {}, "read", () => this.readIsPaused());
-  }
-
-  private async readIsPaused(): Promise<boolean> {
     return Boolean(await this.view("is_paused"));
   }
 
@@ -880,10 +667,6 @@ export abstract class VaultBase {
    * Returns on-chain information about the vault's active adapter.
    */
   async getAdapterInfo(): Promise<AdapterInfo> {
-    return this.run("getAdapterInfo", {}, "read", () => this.readAdapterInfo());
-  }
-
-  private async readAdapterInfo(): Promise<AdapterInfo> {
     const server = this.makeRpcServer();
     const { passphrase } = this.config.network;
     const contractId = this.contractId;

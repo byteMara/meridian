@@ -516,8 +516,7 @@ describe("getRpcAdminHistory", () => {
   function adminEvent(
     action: string,
     value: xdr.ScVal,
-    ledgerClosedAt = "2026-08-27T20:00:00Z",
-    schemaVersion: number | null = 1
+    ledgerClosedAt = "2026-08-27T20:00:00Z"
   ): rpc.Api.EventResponse {
     return {
       type: "contract",
@@ -525,11 +524,7 @@ describe("getRpcAdminHistory", () => {
       ledgerClosedAt,
       id: "0000000100000000-0000000001",
       pagingToken: "0000000100000000-0000000001",
-      topic: [
-        xdr.ScVal.scvSymbol("admin"),
-        xdr.ScVal.scvSymbol(action),
-        ...(schemaVersion === null ? [] : [xdr.ScVal.scvU32(schemaVersion)]),
-      ],
+      topic: [xdr.ScVal.scvSymbol("admin"), xdr.ScVal.scvSymbol(action)],
       value,
       inSuccessfulContractCall: true,
       txHash: "HASH",
@@ -540,11 +535,12 @@ describe("getRpcAdminHistory", () => {
     vi.restoreAllMocks();
   });
 
-  it("filters on both legacy and versioned admin topic shapes", async () => {
+  it("filters on a two-segment admin topic, not a one-segment one", async () => {
     // Soroban RPC's getEvents topic filter matches an event's topic array by
-    // exact segment count, so both shapes need their own filter. A filter
-    // missing the final wildcard would match zero real events, passing every
-    // other test here only because they mock getEvents directly.
+    // exact segment count. The vault's admin events all carry two segments —
+    // (admin, <action>) — so a filter missing the wildcarded second position
+    // would match zero real events, passing every other test here only
+    // because they mock getEvents directly instead of exercising this.
     const getEventsSpy = vi
       .spyOn(rpc.Server.prototype, "getEvents")
       .mockResolvedValueOnce({
@@ -555,75 +551,10 @@ describe("getRpcAdminHistory", () => {
     await getRpcAdminHistory(network.rpcUrl, VAULT_ID);
 
     const [request] = getEventsSpy.mock.calls[0]!;
-    const filters = (request as { filters: rpc.Api.EventFilter[] }).filters;
-    expect(filters).toHaveLength(2);
-    expect(filters[0]!.topics![0]).toHaveLength(2);
-    expect(filters[0]!.topics![0]![1]).toBe("*");
-    expect(filters[1]!.topics![0]).toHaveLength(3);
-    expect(filters[1]!.topics![0]![1]).toBe("*");
-    expect(filters[1]!.topics![0]![2]).toBe("*");
-  });
-
-  it("parses a legacy unversioned admin event", async () => {
-    vi.spyOn(rpc.Server.prototype, "getEvents").mockResolvedValueOnce({
-      events: [
-        adminEvent(
-          "paused",
-          xdr.ScVal.scvBool(true),
-          "2026-08-27T20:00:00Z",
-          null
-        ),
-      ],
-      latestLedger: 100,
-    } as never);
-
-    const { actions } = await getRpcAdminHistory(network.rpcUrl, VAULT_ID);
-
-    expect(actions[0]).toMatchObject({
-      action: "paused",
-      payload: { paused: true },
-    });
-  });
-
-  it("skips unknown schema versions and warns with each version and count", async () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
-    vi.spyOn(rpc.Server.prototype, "getEvents").mockResolvedValueOnce({
-      events: [
-        adminEvent(
-          "paused",
-          xdr.ScVal.scvBool(true),
-          "2026-08-27T20:00:00Z",
-          2
-        ),
-        adminEvent(
-          "paused",
-          xdr.ScVal.scvBool(true),
-          "2026-08-27T20:00:00Z",
-          2
-        ),
-        adminEvent(
-          "paused",
-          xdr.ScVal.scvBool(true),
-          "2026-08-27T20:00:00Z",
-          3
-        ),
-        adminEvent("paused", xdr.ScVal.scvBool(false)),
-      ],
-      latestLedger: 100,
-    } as never);
-
-    const { actions } = await getRpcAdminHistory(network.rpcUrl, VAULT_ID);
-
-    expect(actions).toHaveLength(1);
-    expect(warn).toHaveBeenCalledTimes(2);
-    expect(warn).toHaveBeenCalledWith(
-      expect.stringContaining("schema version 2"),
-      { version: 2, count: 2 }
-    );
-    expect(warn).toHaveBeenCalledWith(
-      expect.stringContaining("schema version 3"),
-      { version: 3, count: 1 }
-    );
+    const filter = (request as { filters: rpc.Api.EventFilter[] }).filters[0]!;
+    expect(filter.topics).toHaveLength(1);
+    expect(filter.topics![0]).toHaveLength(2);
+    expect(filter.topics![0]![1]).toBe("*");
   });
 
   it("parses a paused event", async () => {
